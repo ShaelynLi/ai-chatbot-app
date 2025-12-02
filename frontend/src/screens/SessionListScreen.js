@@ -1,0 +1,648 @@
+import React, { useState, useEffect, useLayoutEffect } from 'react';
+import {
+  Alert,
+  Modal,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+  RefreshControl,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { Ionicons } from '@expo/vector-icons';
+import { useChat } from '../context/ChatContext';
+import { chatDb } from '../db/database';
+
+export function SessionListScreen({ navigation, onClose }) {
+  const { sessions, refreshSessions } = useChat();
+  const [sessionPreviews, setSessionPreviews] = useState({});
+  const [expandedSections, setExpandedSections] = useState({
+    today: true,
+    previous7Days: true,
+  });
+  const [menuVisible, setMenuVisible] = useState(false);
+  const [selectedSession, setSelectedSession] = useState(null);
+  const [renameModalVisible, setRenameModalVisible] = useState(false);
+  const [renameText, setRenameText] = useState('');
+  const [isLayoutReady, setIsLayoutReady] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // 加载每个会话的预览消息
+  const loadPreviews = async () => {
+    const previews = {};
+    for (const session of sessions) {
+      try {
+        const messages = await chatDb.listMessages(session.id);
+        const firstUserMessage = messages.find((m) => m.role === 'user');
+        const firstAssistantMessage = messages.find((m) => m.role === 'assistant');
+
+        const displayTitle =
+          session.title && session.title !== '新会话'
+            ? session.title
+            : firstUserMessage?.content || session.title || '未命名会话';
+
+        previews[session.id] = {
+          title: displayTitle,
+          preview: firstAssistantMessage?.content || '',
+        };
+      } catch (error) {
+        console.error('Error loading preview:', error);
+        previews[session.id] = {
+          title: session.title || '未命名会话',
+          preview: '',
+        };
+      }
+    }
+    setSessionPreviews(previews);
+  };
+
+  useEffect(() => {
+    loadPreviews();
+  }, [sessions]);
+
+  // Use useLayoutEffect to ensure layout is calculated when component mounts
+  useLayoutEffect(() => {
+    setIsLayoutReady(false);
+    // Force layout recalculation on mount - use multiple frames to ensure layout is stable
+    const timer = setTimeout(() => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          setIsLayoutReady(true);
+        });
+      });
+    }, 0);
+    return () => clearTimeout(timer);
+  }, []);
+
+
+  const handleMenuPress = (session, e) => {
+    e.stopPropagation();
+    setSelectedSession(session);
+    setMenuVisible(true);
+  };
+
+  const handleDelete = () => {
+    if (!selectedSession) return;
+    
+    Alert.alert(
+      'Delete Conversation',
+      'Are you sure you want to delete this conversation? This action cannot be undone.',
+      [
+        {
+          text: 'Cancel',
+          style: 'cancel',
+          onPress: () => setMenuVisible(false),
+        },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const deletedSessionId = selectedSession.id;
+              await chatDb.deleteSession(deletedSessionId);
+              await refreshSessions();
+              setMenuVisible(false);
+              setSelectedSession(null);
+              
+              // 如果当前正在查看被删除的会话，导航回主界面
+              // 注意：ChatbotScreen 会通过监听 sessions 变化自动重置，这里作为额外保障
+              if (navigation) {
+                const state = navigation.getState();
+                const currentRoute = state?.routes[state?.index];
+                // 检查 Chatbot 或 Chat 路由（兼容旧版本）
+                if ((currentRoute?.name === 'Chatbot' || currentRoute?.name === 'Chat') && 
+                    currentRoute?.params?.sessionId === deletedSessionId) {
+                  navigation.navigate('Chatbot');
+                }
+              }
+            } catch (error) {
+              console.error('Error deleting session:', error);
+              Alert.alert('Error', 'Failed to delete conversation. Please try again.');
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleRename = () => {
+    if (!selectedSession) return;
+    const preview = sessionPreviews[selectedSession.id];
+    setRenameText(preview?.title || selectedSession.title || '');
+    setMenuVisible(false);
+    setRenameModalVisible(true);
+  };
+
+  const handleRenameConfirm = async () => {
+    if (!selectedSession || !renameText.trim()) {
+      Alert.alert('Error', 'Please enter a valid name.');
+      return;
+    }
+
+    try {
+      const newTitle = renameText.trim();
+      await chatDb.updateSessionTitle(selectedSession.id, newTitle);
+      await refreshSessions();
+      
+      // Update sessionPreviews immediately to reflect the change
+      setSessionPreviews((prev) => ({
+        ...prev,
+        [selectedSession.id]: {
+          ...prev[selectedSession.id],
+          title: newTitle,
+        },
+      }));
+      
+      setRenameModalVisible(false);
+      setRenameText('');
+      setSelectedSession(null);
+    } catch (error) {
+      console.error('Error renaming session:', error);
+      Alert.alert('Error', 'Failed to rename conversation. Please try again.');
+    }
+  };
+
+  const formatTime = (timestamp) => {
+    const date = new Date(timestamp);
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+
+    if (diffMins < 1) return 'Just now';
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) {
+      const hours = date.getHours();
+      const mins = date.getMinutes();
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      const displayHours = hours % 12 || 12;
+      return `${displayHours}:${mins.toString().padStart(2, '0')} ${ampm}`;
+    }
+    if (diffDays <= 7) {
+      const hours = date.getHours();
+      const mins = date.getMinutes();
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      const displayHours = hours % 12 || 12;
+      return `${displayHours}:${mins.toString().padStart(2, '0')} ${ampm}`;
+    }
+    return date.toLocaleDateString();
+  };
+
+  const groupSessions = () => {
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const sevenDaysAgo = new Date(todayStart);
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const today = [];
+    const previous7Days = [];
+
+    sessions.forEach((session) => {
+      const sessionDate = new Date(session.created_at);
+      if (sessionDate >= todayStart) {
+        today.push(session);
+      } else if (sessionDate >= sevenDaysAgo) {
+        previous7Days.push(session);
+      }
+    });
+
+    return { today, previous7Days };
+  };
+
+  const { today, previous7Days } = groupSessions();
+
+  const toggleSection = (section) => {
+    setExpandedSections((prev) => ({
+      ...prev,
+      [section]: !prev[section],
+    }));
+  };
+
+  const renderSessionCard = (session) => {
+    const preview = sessionPreviews[session.id] || {
+      title: session.title || '未命名会话',
+      preview: '',
+    };
+    const truncatedTitle =
+      preview.title.length > 30 ? preview.title.substring(0, 30) + '..' : preview.title;
+    const truncatedPreview =
+      preview.preview.length > 60 ? preview.preview.substring(0, 60) + '..' : preview.preview;
+
+    return (
+      <TouchableOpacity
+        key={session.id}
+        style={styles.sessionCard}
+        onPress={() => handleSessionPress(session.id)}
+      >
+        <View style={styles.sessionCardContent}>
+          <View style={styles.sessionCardText}>
+            <Text style={styles.sessionCardTitle}>{truncatedTitle}</Text>
+            {truncatedPreview && (
+              <Text style={styles.sessionCardPreview} numberOfLines={2}>
+                {truncatedPreview}
+              </Text>
+            )}
+          </View>
+          <View style={styles.sessionCardRight}>
+            <TouchableOpacity
+              style={styles.moreButton}
+              onPress={(e) => handleMenuPress(session, e)}
+            >
+              <Ionicons name="ellipsis-vertical" size={20} color="#6B7280" />
+            </TouchableOpacity>
+            <Text style={styles.sessionCardTime}>{formatTime(session.created_at)}</Text>
+          </View>
+        </View>
+      </TouchableOpacity>
+    );
+  };
+
+  const renderSection = (title, sessions, sectionKey) => {
+    if (sessions.length === 0) return null;
+
+    return (
+      <View style={styles.section}>
+        <TouchableOpacity
+          style={styles.sectionHeader}
+          onPress={() => toggleSection(sectionKey)}
+        >
+          <Text style={styles.sectionTitle}>{title}</Text>
+          <Ionicons
+            name={expandedSections[sectionKey] ? 'chevron-down' : 'chevron-forward'}
+            size={20}
+            color="#6B7280"
+          />
+        </TouchableOpacity>
+        {expandedSections[sectionKey] && (
+          <View style={styles.sectionContent}>
+            {sessions.map((session) => renderSessionCard(session))}
+          </View>
+        )}
+      </View>
+    );
+  };
+
+  const handleSessionPress = (sessionId) => {
+    // Close sidebar first
+    if (onClose) {
+      onClose();
+    }
+    // Navigate to Chatbot screen with sessionId - use a small delay to ensure sidebar closes smoothly
+    setTimeout(() => {
+      if (navigation) {
+        navigation.navigate('Chatbot', { sessionId });
+      }
+    }, 100);
+  };
+
+  const handleNewSessionPress = async () => {
+    try {
+      // 先关闭侧边栏
+      if (onClose) {
+        onClose();
+      }
+
+      // 立即在本地数据库中创建一个新的会话
+      const newSession = await chatDb.createSession();
+      await refreshSessions();
+
+      // 略微延迟后导航到 Chatbot，并携带新的 sessionId
+      // 这样 ChatbotScreen 会加载这个全新的空会话，相当于“新建页面”
+      setTimeout(() => {
+        if (navigation) {
+          navigation.navigate('Chatbot', { sessionId: newSession.id });
+        }
+      }, 100);
+    } catch (error) {
+      console.error('Error creating new session:', error);
+      Alert.alert('Error', 'Failed to create a new conversation. Please try again.');
+    }
+  };
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    try {
+      await refreshSessions();
+      await loadPreviews();
+    } catch (error) {
+      console.error('Error refreshing sessions:', error);
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  return (
+    <SafeAreaView 
+      style={styles.safeArea} 
+      edges={['top', 'bottom']}
+      onLayout={() => setIsLayoutReady(true)}
+    >
+      {/* 顶部导航栏 */}
+      <View style={styles.header}>
+        <View style={styles.headerLeftPlaceholder} />
+        <Text style={styles.headerTitle}>Conversation</Text>
+        <TouchableOpacity style={styles.headerIconButton} onPress={handleNewSessionPress}>
+          <Ionicons name="add" size={24} color="#111827" />
+        </TouchableOpacity>
+      </View>
+
+      {/* 分隔线 */}
+      <View style={styles.divider} />
+
+      {/* 会话列表 */}
+      <ScrollView 
+        style={styles.content} 
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handleRefresh}
+            tintColor="#7C3AED"
+            colors={['#7C3AED']}
+          />
+        }
+      >
+        {renderSection('Today', today, 'today')}
+        {renderSection('Previous 7 Days', previous7Days, 'previous7Days')}
+      </ScrollView>
+
+      {/* 菜单 Modal */}
+      <Modal
+        visible={menuVisible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setMenuVisible(false)}
+      >
+        <TouchableOpacity
+          style={styles.modalOverlay}
+          activeOpacity={1}
+          onPress={() => setMenuVisible(false)}
+        >
+          <View style={styles.menuContainer}>
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={handleRename}
+            >
+              <Ionicons name="pencil-outline" size={20} color="#111827" />
+              <Text style={styles.menuItemText}>Rename</Text>
+            </TouchableOpacity>
+            <View style={styles.menuDivider} />
+            <TouchableOpacity
+              style={[styles.menuItem, styles.menuItemDanger]}
+              onPress={handleDelete}
+            >
+              <Ionicons name="trash-outline" size={20} color="#EF4444" />
+              <Text style={[styles.menuItemText, styles.menuItemTextDanger]}>Delete</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </Modal>
+
+      {/* 重命名 Modal */}
+      <Modal
+        visible={renameModalVisible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setRenameModalVisible(false)}
+      >
+        <TouchableOpacity
+          style={styles.modalOverlay}
+          activeOpacity={1}
+          onPress={() => setRenameModalVisible(false)}
+        >
+          <View style={styles.renameModalContainer}>
+            <View style={styles.renameModalContent}>
+              <Text style={styles.renameModalTitle}>Rename Conversation</Text>
+              <TextInput
+                style={styles.renameInput}
+                placeholder="Enter conversation name"
+                placeholderTextColor="#9CA3AF"
+                value={renameText}
+                onChangeText={setRenameText}
+                autoFocus={true}
+                maxLength={50}
+              />
+              <View style={styles.renameModalButtons}>
+                <TouchableOpacity
+                  style={[styles.renameButton, styles.renameButtonCancel]}
+                  onPress={() => {
+                    setRenameModalVisible(false);
+                    setRenameText('');
+                  }}
+                >
+                  <Text style={styles.renameButtonTextCancel}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.renameButton, styles.renameButtonConfirm]}
+                  onPress={handleRenameConfirm}
+                >
+                  <Text style={styles.renameButtonTextConfirm}>Save</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </TouchableOpacity>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  safeArea: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+  },
+  header: {
+    height: 56,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    backgroundColor: '#FFFFFF',
+  },
+  headerIconButton: {
+    width: 32,
+    height: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerLeftPlaceholder: {
+    width: 32,
+    height: 32,
+  },
+  headerTitle: {
+    fontSize: 20,
+    fontWeight: '600',
+    color: '#111827',
+  },
+  divider: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: '#E5E7EB',
+  },
+  content: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+  },
+  section: {
+    marginTop: 24,
+    paddingHorizontal: 20,
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#111827',
+  },
+  sectionContent: {
+    gap: 12,
+  },
+  sessionCard: {
+    backgroundColor: '#F3F4F6',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 8,
+  },
+  sessionCardContent: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  sessionCardText: {
+    flex: 1,
+    marginRight: 12,
+  },
+  sessionCardTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#111827',
+    marginBottom: 4,
+  },
+  sessionCardPreview: {
+    fontSize: 14,
+    color: '#6B7280',
+    lineHeight: 20,
+  },
+  sessionCardRight: {
+    alignItems: 'flex-end',
+    justifyContent: 'space-between',
+  },
+  moreButton: {
+    padding: 4,
+    marginBottom: 8,
+  },
+  sessionCardTime: {
+    fontSize: 12,
+    color: '#9CA3AF',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  menuContainer: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 12,
+    paddingVertical: 8,
+    minWidth: 200,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  menuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+  },
+  menuItemDanger: {
+    // Additional styling for delete item if needed
+  },
+  menuItemText: {
+    fontSize: 16,
+    color: '#111827',
+    marginLeft: 12,
+  },
+  menuItemTextDanger: {
+    color: '#EF4444',
+  },
+  menuDivider: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: '#E5E7EB',
+    marginVertical: 4,
+  },
+  renameModalContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 24,
+  },
+  renameModalContent: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 24,
+    width: '100%',
+    maxWidth: 400,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  renameModalTitle: {
+    fontSize: 20,
+    fontWeight: '600',
+    color: '#111827',
+    marginBottom: 16,
+  },
+  renameInput: {
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 16,
+    color: '#111827',
+    backgroundColor: '#FFFFFF',
+    marginBottom: 20,
+  },
+  renameModalButtons: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 12,
+  },
+  renameButton: {
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 8,
+    minWidth: 80,
+    alignItems: 'center',
+  },
+  renameButtonCancel: {
+    backgroundColor: '#F3F4F6',
+  },
+  renameButtonConfirm: {
+    backgroundColor: '#7C3AED',
+  },
+  renameButtonTextCancel: {
+    fontSize: 16,
+    color: '#6B7280',
+    fontWeight: '500',
+  },
+  renameButtonTextConfirm: {
+    fontSize: 16,
+    color: '#FFFFFF',
+    fontWeight: '500',
+  },
+});
+
+

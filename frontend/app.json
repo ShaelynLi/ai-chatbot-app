@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "AI Chatbot App",
+    "slug": "ai-chatbot-app",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/robot.png",
+    "splash": {
+      "image": "./assets/robot.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#F7F7FB"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/robot.png",
+        "backgroundColor": "#F7F7FB"
+      }
+    },
+    "web": {
+      "favicon": "./assets/robot.png"
+    }
+  }
+}
+
+
