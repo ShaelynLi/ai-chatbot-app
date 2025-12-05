@@ -1,3 +1,26 @@
+/**
+ * 聊天主界面（ChatbotScreen）
+ * 
+ * 功能：
+ * - 支持纯文本和多模态（图片+文本）消息发送
+ * - 支持多版本消息管理（编辑提问，生成多版回复）
+ * - 支持离线队列和自动重试（网络恢复后自动重发待发送消息）
+ * - 支持消息状态显示（发送中/待发送/失败/已发送）
+ * - 支持图片上传和预览（单图/多图）
+ * - 支持性能优化（只渲染最近 N 轮对话，支持加载更多历史）
+ * - 支持动态思考状态显示（"正在分析图片..." vs "正在思考回复..."）
+ * 
+ * UI 结构：
+ * - 顶部导航栏：左侧汉堡按钮（打开侧边栏）+ 中间标题 + 右侧 Profile 图标
+ * - 中间聊天区域：机器人形象 + 欢迎气泡（无消息时）或消息列表
+ * - 底部输入区：文本输入框 + 图片按钮 + 发送按钮
+ * 
+ * 核心特性：
+ * - 会话管理：自动创建会话，支持切换会话
+ * - 消息持久化：所有消息保存到本地 SQLite
+ * - 网络监听：自动检测网络状态，网络恢复后重试待发送消息
+ */
+
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   ActivityIndicator,
@@ -18,20 +41,19 @@ import { useFocusEffect } from '@react-navigation/native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useSidebar } from '../context/SidebarContext';
 import { chatDb } from '../db/database';
-import { sendMessageToBackend, generateTitleFromBackend } from '../services/api';
+import { sendMessageToBackend, generateTitleFromBackend, sendMessageWithImage } from '../services/api';
 import { useChat } from '../context/ChatContext';
 import { MessageBubble } from '../components/MessageBubble';
+import * as ImagePicker from 'expo-image-picker';
+import { saveImageToLocal, readImageAsBase64, base64ToDataUrl } from '../services/fileStorage';
+import NetInfo from '@react-native-community/netinfo';
 
-/**
- * 聊天主界面，支持在主界面直接聊天，不跳转到新页面
- * - 顶部导航栏：左侧汉堡按钮 + 中间标题 "Chatbot AI" + 右侧 Profile 图标
- * - 中间机器人形象 + 欢迎气泡（仅在无消息时显示）
- * - 底部圆角输入框 + 麦克风图标 + 紫色发送按钮
- */
+// 最大自动重试次数（用于离线队列功能）
+const MAX_AUTO_RETRY = 3;
 
 export function ChatbotScreen({ navigation, route }) {
   const { openSidebar } = useSidebar();
-  const { sessions, refreshSessions } = useChat();
+  const { sessions, refreshSessions, createSession } = useChat();
   const [message, setMessage] = useState('');
   const scrollViewRef = useRef(null);
   const [loading, setLoading] = useState(false);
@@ -47,10 +69,17 @@ export function ChatbotScreen({ navigation, route }) {
   const [editingMessage, setEditingMessage] = useState(null);
   const [editInput, setEditInput] = useState('');
   const [refreshing, setRefreshing] = useState(false);
+  
+  // 待发送的图片预览列表（选择后暂存，等待用户发送）
+  const [pendingImages, setPendingImages] = useState([]);
 
   // 组织消息版本：将同一用户消息的多个AI回复版本组织在一起
   // 将扁平 messages 组织成对话轮（Turn）：每轮包含多版提问 + 多版回答
   const [turnVersionIndices, setTurnVersionIndices] = useState({});
+  const [isOnline, setIsOnline] = useState(true);
+  const retryingQueuedRef = useRef(false);
+  // 为避免大量历史消息一次性渲染导致卡顿，只显示最近若干轮对话，支持“加载更多”
+  const [visibleTurnCount, setVisibleTurnCount] = useState(20);
 
   const buildTurns = useCallback((rawMessages) => {
     const anchors = new Map(); // anchorUserId -> { userVersions, assistantVersions }
@@ -119,6 +148,126 @@ export function ChatbotScreen({ navigation, route }) {
     return turns;
   }, []);
 
+  const updateMessageStatusInState = useCallback((messageId, status, retryCount) => {
+    setMessages((prev) =>
+      prev.map((msg) =>
+        msg.id === messageId
+          ? {
+              ...msg,
+              status,
+              retry_count:
+                typeof retryCount === 'number' ? retryCount : msg.retry_count,
+            }
+          : msg
+      )
+    );
+  }, []);
+
+  const resendUserMessage = useCallback(
+    async (messageRecord, { force = false } = {}) => {
+      if (!messageRecord) return;
+      const sessionId = messageRecord.session_id || messageRecord.sessionId || currentSessionId;
+      if (!sessionId) return;
+
+      await chatDb.updateMessageStatus(messageRecord.id, 'sending', messageRecord.retry_count || 0);
+      if (sessionId === currentSessionId) {
+        updateMessageStatusInState(messageRecord.id, 'sending', messageRecord.retry_count || 0);
+      }
+
+      try {
+        const { reply } = await sendMessageToBackend({
+          message: messageRecord.content,
+          sessionId,
+        });
+
+        await chatDb.updateMessageStatus(messageRecord.id, 'sent', 0);
+        if (sessionId === currentSessionId) {
+          updateMessageStatusInState(messageRecord.id, 'sent', 0);
+        }
+
+        const aiMsg = await chatDb.addMessage(
+          sessionId,
+          'assistant',
+          reply,
+          messageRecord.parent_message_id || messageRecord.id
+        );
+        if (sessionId === currentSessionId) {
+          setMessages((prev) => [...prev, aiMsg]);
+        }
+      } catch (error) {
+        if (error.code === 'NETWORK_ERROR') {
+          const baseRetry = messageRecord.retry_count || 0;
+          const nextRetry = force ? 0 : baseRetry + 1;
+          const reachedLimit = !force && nextRetry >= MAX_AUTO_RETRY;
+          const nextStatus = reachedLimit ? 'failed' : 'queued';
+          await chatDb.updateMessageStatus(messageRecord.id, nextStatus, nextRetry);
+          if (sessionId === currentSessionId) {
+            updateMessageStatusInState(messageRecord.id, nextStatus, nextRetry);
+          }
+        } else {
+          await chatDb.updateMessageStatus(messageRecord.id, 'failed', messageRecord.retry_count || 0);
+          if (sessionId === currentSessionId) {
+            updateMessageStatusInState(messageRecord.id, 'failed', messageRecord.retry_count || 0);
+          }
+          Alert.alert('发送失败', error.message);
+        }
+      }
+    },
+    [currentSessionId, updateMessageStatusInState]
+  );
+
+  const retryQueuedMessages = useCallback(async () => {
+    if (retryingQueuedRef.current) return;
+    retryingQueuedRef.current = true;
+    try {
+      const queued = await chatDb.listQueuedUserMessages();
+      for (const msg of queued) {
+        await resendUserMessage(msg, { force: false });
+      }
+    } catch (error) {
+      console.error('Retry queued messages failed:', error);
+    } finally {
+      retryingQueuedRef.current = false;
+    }
+  }, [resendUserMessage]);
+
+  const handleManualRetryUserMessage = useCallback(
+    (message) => resendUserMessage(message, { force: true }),
+    [resendUserMessage]
+  );
+
+  const ensureSessionHasTitle = useCallback(
+    async (sessionId) => {
+      if (!sessionId) return;
+      try {
+        const session = sessions.find((s) => s.id === sessionId);
+        const isDefaultTitle = !session || !session.title || session.title === '新会话';
+        if (isDefaultTitle) {
+          const { title } = await generateTitleFromBackend({ sessionId });
+          if (title && title.trim()) {
+            await chatDb.updateSessionTitle(sessionId, title.trim());
+          }
+        }
+      } catch (e) {
+        // 静默处理自动生成标题失败，不影响用户体验
+        // 自动生成标题是辅助功能，失败时不应该影响正常使用
+        const errorMsg = e?.message || String(e);
+        const isNetworkError = 
+          errorMsg.includes('无法连接到后端服务') || 
+          errorMsg.includes('NETWORK_ERROR') ||
+          errorMsg.includes('Network request failed') ||
+          errorMsg.includes('timeout');
+        
+        // 网络错误完全静默处理，不输出任何日志
+        // 其他错误只在开发环境输出简要日志
+        if (!isNetworkError && __DEV__) {
+          console.warn('Auto-generate session title failed (non-critical):', errorMsg);
+        }
+      }
+    },
+    [sessions]
+  );
+
   // 使用 useFocusEffect 监听页面聚焦和路由参数变化
   // 仅当路由显式带上 sessionId 时，才根据路由切换会话；
   // 普通在主界面连续聊天（没有路由参数变化）时，不会重置当前会话。
@@ -184,6 +333,16 @@ export function ChatbotScreen({ navigation, route }) {
         scrollViewRef.current?.scrollToEnd({ animated: true });
       }, 100);
     }
+  }, [messages]);
+
+  // 最近一条用户消息是否包含图片，用于动态展示“正在分析图片 / 正在思考回复”文案
+  const lastUserHasImages = useMemo(() => {
+    if (!messages || messages.length === 0) return false;
+    const reversed = [...messages].reverse();
+    const found = reversed.find(
+      (m) => m.role === 'user' && m.allImageUris && m.allImageUris.length > 0
+    );
+    return !!found;
   }, [messages]);
 
   // 重新生成AI回复
@@ -274,86 +433,26 @@ export function ChatbotScreen({ navigation, route }) {
     const editedContent = editInput.trim();
     let sessionId = currentSessionId;
 
-    // 如果还没有会话，先创建
+    // 如果还没有会话，先通过上下文创建
     if (!sessionId) {
-      const session = await chatDb.createSession();
+      const session = await createSession();
       sessionId = session.id;
       setCurrentSessionId(sessionId);
-      await refreshSessions();
     }
 
-    // 以最初的用户消息作为锚点：所有用户/AI 版本都挂在这个锚点下面
     const anchorUserId = editingMessage.parent_message_id || editingMessage.id;
 
-    // 在数据库中记录这条新的用户消息（作为单独一条记录，用于保留历史）
-    await chatDb.addMessage(sessionId, 'user', editedContent, anchorUserId);
+    const newUserMsg = await chatDb.addMessage(sessionId, 'user', editedContent, anchorUserId);
+    setMessages((prev) => [...prev, newUserMsg]);
+
+    // 退出编辑模式
+    setEditingMessage(null);
+    setEditInput('');
 
     setLoading(true);
     try {
-      const { reply } = await sendMessageToBackend({ message: editedContent, sessionId });
-
-      // 保存新的 AI 版本到数据库，关联到锚点用户消息
-      const newVersion = await chatDb.addMessage(
-        sessionId,
-        'assistant',
-        reply,
-        anchorUserId
-      );
-
-      // 在现有 AI 消息上追加一个版本（或新建一条带版本的 AI 消息）
-      setMessages(prev => {
-        const updated = [...prev];
-
-        // 在当前消息列表中查找与该用户消息关联的 AI 消息
-        const aiIndex = updated.findIndex(
-          (m) =>
-            m.role === 'assistant' &&
-            ((m.parentMessageId ?? m.parent_message_id) === anchorUserId)
-        );
-
-        // 没有找到已聚合的 AI 消息，直接追加一条新的带版本的消息
-        if (aiIndex === -1) {
-          const aiMsgWithVersions = {
-            ...newVersion,
-            versions: [newVersion],
-            currentVersionIndex: 0,
-          };
-          return [...updated, aiMsgWithVersions];
-        }
-
-        // 找到已存在的 AI 消息，在其 versions 上追加一个版本
-        const aiMsg = updated[aiIndex];
-        const baseVersions = Array.isArray(aiMsg.versions) && aiMsg.versions.length > 0
-          ? aiMsg.versions
-          : [aiMsg];
-        const versions = [...baseVersions, newVersion];
-
-        updated[aiIndex] = {
-          ...aiMsg,
-          versions,
-          currentVersionIndex: versions.length - 1,
-          content: newVersion.content,
-          parentMessageId: editingMessage.id,
-        };
-
-        return updated;
-      });
-
-      // 编辑完成，退出编辑模式
-      setEditingMessage(null);
-      setEditInput('');
-
-      // 为确保提问/回答版本与本地 state 完全同步，重新从数据库加载当前会话消息
-      try {
-        if (sessionId) {
-          const rawMsgs = await chatDb.listMessages(sessionId);
-          setMessages(rawMsgs);
-        }
-      } catch (e) {
-        console.error('Reload messages after edit failed:', e);
-      }
-
-      // 刷新会话列表（更新时间等）
+      await resendUserMessage({ ...newUserMsg, session_id: sessionId }, { force: true });
+      await ensureSessionHasTitle(sessionId);
       await refreshSessions();
       Alert.alert('已重新发送', '基于最新内容生成了新的回复版本');
     } catch (error) {
@@ -430,7 +529,7 @@ export function ChatbotScreen({ navigation, route }) {
       const newErrorMsg = {
         id: `error-${Date.now()}`,
         role: 'assistant',
-        content: `请求失败：${error.message}`,
+        content: error.message || '发送失败，请检查网络或稍后重试。',
         isError: true,
         retryMessage: userContent,
         sessionId,
@@ -441,80 +540,188 @@ export function ChatbotScreen({ navigation, route }) {
     }
   };
 
+  // 选择图片（添加到预览列表，不立即发送）
+  const handlePickImage = async () => {
+    if (loading) return;
+
+    try {
+      // 请求相册权限
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('需要权限', '需要相册权限才能选择图片');
+        return;
+      }
+
+      // 选择图片
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: 'images',
+        allowsEditing: false,
+        quality: 0.8,
+        allowsMultipleSelection: true, // 支持多选
+      });
+
+      if (result.canceled) return;
+
+      // 处理选中的图片（支持多选）
+      const newImages = [];
+      for (const asset of result.assets) {
+        try {
+          // 保存图片到本地文件系统
+          const localUri = await saveImageToLocal(asset.uri);
+          newImages.push({
+            id: `pending-${Date.now()}-${Math.random()}`, // 临时 ID
+            uri: localUri,
+            originalUri: asset.uri,
+          });
+        } catch (error) {
+          console.error('Error saving image:', error);
+          Alert.alert('保存图片失败', `无法保存图片: ${error.message}`);
+        }
+      }
+
+      // 添加到预览列表
+      if (newImages.length > 0) {
+        setPendingImages((prev) => [...prev, ...newImages]);
+      }
+    } catch (error) {
+      console.error('Error picking image:', error);
+      Alert.alert('选择图片失败', error.message || '请稍后重试');
+    }
+  };
+
+  // 删除预览中的图片
+  const handleRemovePendingImage = (imageId) => {
+    setPendingImages((prev) => prev.filter((img) => img.id !== imageId));
+  };
+
   const handleSend = async () => {
-    if (loading || !message.trim() || message.length > 1000) return;
+    // 验证：至少要有文字或图片
+    const hasText = message.trim().length > 0;
+    const hasImages = pendingImages.length > 0;
     
+    if (loading || (!hasText && !hasImages) || message.length > 1000) {
+      if (!hasText && !hasImages) {
+        Alert.alert('提示', '请输入消息或选择图片');
+      }
+      return;
+    }
+
     const userContent = message.trim();
+    const imagesToSend = [...pendingImages]; // 复制待发送的图片列表
+    
+    // 清空输入和预览
     setMessage('');
+    setPendingImages([]);
 
     // 如果没有当前会话，根据路由或直接新建一个全新的会话
     let sessionId = currentSessionId;
     if (!sessionId) {
-      // 优先使用路由上携带的 sessionId（例如从侧边栏点进来的已有会话）
       if (route?.params?.sessionId) {
         sessionId = route.params.sessionId;
       } else {
-        // 否则就创建一个全新的会话（防止误把消息写进上一次的会话）
-        const session = await chatDb.createSession();
+        const session = await createSession();
         sessionId = session.id;
-        await refreshSessions();
       }
       setCurrentSessionId(sessionId);
     }
 
-    // 先显示用户消息，提供即时反馈
-    const userMsg = await chatDb.addMessage(sessionId, 'user', userContent);
-    setMessages((prev) => [...prev, userMsg]);
+    let imageUserMessage = null;
+    let savedImageIds = [];
+
+    if (imagesToSend.length === 0) {
+      try {
+        setLoading(true);
+        const userMsg = await chatDb.addMessage(sessionId, 'user', userContent);
+        setMessages((prev) => [...prev, userMsg]);
+        await resendUserMessage({ ...userMsg, session_id: sessionId });
+        await ensureSessionHasTitle(sessionId);
+        await refreshSessions();
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
 
     setLoading(true);
+
     try {
-      // 调用 API 获取 AI 回复
-      const { reply } = await sendMessageToBackend({
+      // 图片消息发送流程
+      let allImageUris = [];
+      let allImageIds = [];
+
+      // 保存所有图片到数据库
+      for (const img of imagesToSend) {
+        const imageRecord = await chatDb.addImage(sessionId, img.uri);
+        allImageUris.push(img.uri);
+        allImageIds.push(imageRecord.id);
+      }
+      savedImageIds = allImageIds;
+
+      // 创建用户消息（带第一张图片的 URI，用于显示）
+      imageUserMessage = await chatDb.addMessage(sessionId, 'user', userContent);
+      
+      // 在消息中添加图片信息（用于显示）
+      const userMsgWithImage = {
+        ...imageUserMessage,
+        imageUri: allImageUris[0], // 第一张图片用于显示
+        imageId: allImageIds[0],
+        allImageUris: allImageUris, // 所有图片 URI
+      };
+      setMessages((prev) => [...prev, userMsgWithImage]);
+
+      // 读取所有图片为 base64，发送到后端（支持多图）
+      const imagesBase64 = [];
+      for (const img of imagesToSend) {
+        const base64 = await readImageAsBase64(img.uri);
+        const imageDataUrl = base64ToDataUrl(base64);
+        imagesBase64.push(imageDataUrl);
+      }
+
+      const { reply } = await sendMessageWithImage({
         message: userContent,
+        imagesBase64,
         sessionId,
       });
-      
-      // 保存 AI 回复到数据库（第一个版本），直接关联到该用户消息作为锚点
-      const aiMsg = await chatDb.addMessage(sessionId, 'assistant', reply, userMsg.id);
-      // 添加版本信息，并显式保存 camelCase 的 parentMessageId，方便前端使用
+
+      await chatDb.updateMessageStatus(imageUserMessage.id, 'sent', 0);
+      updateMessageStatusInState(imageUserMessage.id, 'sent', 0);
+
+      // 保存 AI 回复
+      const aiMsg = await chatDb.addMessage(sessionId, 'assistant', reply, imageUserMessage.id);
       const aiMsgWithVersions = {
         ...aiMsg,
-        parentMessageId: userMsg.id,
+        parentMessageId: imageUserMessage.id,
         versions: [aiMsg],
         currentVersionIndex: 0,
       };
       setMessages((prev) => [...prev, aiMsgWithVersions]);
 
-      // 自动生成会话标题（仅在标题为默认值时）
-      try {
-        const session = sessions.find((s) => s.id === sessionId);
-        const isDefaultTitle = !session || !session.title || session.title === '新会话';
-
-        if (isDefaultTitle) {
-          const { title } = await generateTitleFromBackend({ sessionId });
-          if (title && title.trim()) {
-            await chatDb.updateSessionTitle(sessionId, title.trim());
-          }
-        }
-      } catch (e) {
-        console.error('Auto-generate session title failed:', e);
-      }
-
-      // 刷新会话列表以显示最新标题
+      await ensureSessionHasTitle(sessionId);
       await refreshSessions();
     } catch (error) {
       console.error('Error sending message:', error);
-      // 错误消息不保存到数据库，只显示在 UI 中（临时状态）
-      // 使用临时 ID 标识错误消息，方便后续重试时替换
-      const errorMsg = {
-        id: `error-${Date.now()}`,
-        role: 'assistant',
-        content: `请求失败：${error.message}`,
-        isError: true, // 标记为错误消息
-        retryMessage: userContent, // 保存原始消息，用于重试
-        sessionId, // 保存会话 ID，用于重试
-      };
-      setMessages((prev) => [...prev, errorMsg]);
+      if (imagesToSend.length > 0) {
+        if (imageUserMessage) {
+          try {
+            await chatDb.deleteMessage(imageUserMessage.id);
+          } catch (e) {
+            console.warn('Failed to delete failed image message:', e);
+          }
+          setMessages((prev) => prev.filter((msg) => msg.id !== imageUserMessage.id));
+        }
+        if (savedImageIds.length > 0) {
+          for (const imageId of savedImageIds) {
+            try {
+              await chatDb.deleteImage(imageId);
+            } catch (e) {
+              console.warn('Failed to delete pending image record:', imageId, e);
+            }
+          }
+        }
+        setPendingImages(imagesToSend);
+        setMessage(userContent);
+        Alert.alert('发送失败', error.message || '网络异常，请稍后重试。');
+      }
     } finally {
       setLoading(false);
     }
@@ -595,6 +802,22 @@ export function ChatbotScreen({ navigation, route }) {
   // 根据扁平 messages 构建对话轮，用于渲染成“提问 + 回答”成对的版本化气泡
   const turns = useMemo(() => buildTurns(messages), [messages, buildTurns]);
 
+  // 当消息或当前会话变化时，重置可见轮数为默认值
+  useEffect(() => {
+    setVisibleTurnCount(20);
+  }, [currentSessionId, messages.length]);
+
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener((state) => {
+      const connected = !!(state.isConnected && (state.isInternetReachable ?? true));
+      setIsOnline(connected);
+      if (connected) {
+        retryQueuedMessages();
+      }
+    });
+    return () => unsubscribe();
+  }, [retryQueuedMessages]);
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <KeyboardAvoidingView
@@ -610,13 +833,27 @@ export function ChatbotScreen({ navigation, route }) {
           >
             <MaterialCommunityIcons name="menu" size={24} color="#111827" />
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>Chatbot AI</Text>
-          <TouchableOpacity
-            style={styles.headerIconButton}
-            onPress={() => navigation?.navigate('Profile')}
-          >
-            <Ionicons name="person-outline" size={24} color="#111827" />
-          </TouchableOpacity>
+          <Text style={styles.headerTitle}>AI 助手</Text>
+          <View style={styles.headerRight}>
+            <TouchableOpacity
+              style={styles.headerIconButton}
+              onPress={() => {
+                if (currentSessionId) {
+                  navigation?.navigate('ImageGallery', { sessionId: currentSessionId });
+                } else {
+                  Alert.alert('提示', '请先开始一个会话');
+                }
+              }}
+            >
+              <Ionicons name="images-outline" size={24} color="#111827" />
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.headerIconButton}
+              onPress={() => navigation?.navigate('Profile')}
+            >
+              <Ionicons name="person-outline" size={24} color="#111827" />
+            </TouchableOpacity>
+          </View>
         </View>
 
         {/* 中间内容区域 */}
@@ -654,7 +891,7 @@ export function ChatbotScreen({ navigation, route }) {
                     <Ionicons name="sparkles" size={18} color="#7C3AED" />
                   </View>
                   <Text style={styles.welcomeText}>
-                    Hi, I'm your AI assistant. Ask me anything!
+                    我是你的 AI 助手，有什么可以帮你的吗？
                   </Text>
                 </View>
               </View>
@@ -672,7 +909,29 @@ export function ChatbotScreen({ navigation, route }) {
           {/* 聊天记录：有消息时显示（按对话轮渲染，提问 + 回答成对，版本同步） */}
           {!showWelcome && !isLoadingMessages && (
             <View style={styles.chatList}>
-              {turns.map((turn) => {
+              {(() => {
+                const totalTurns = turns.length;
+                const startIndex =
+                  totalTurns > visibleTurnCount ? totalTurns - visibleTurnCount : 0;
+                const visibleTurns = turns.slice(startIndex);
+
+                return (
+                  <>
+                    {/* 顶部“加载更多”按钮：仅在有更多历史轮次时显示 */}
+                    {startIndex > 0 && (
+                      <TouchableOpacity
+                        style={styles.loadMoreButton}
+                        onPress={() =>
+                          setVisibleTurnCount((prev) =>
+                            Math.min(prev + 20, totalTurns)
+                          )
+                        }
+                      >
+                        <Text style={styles.loadMoreText}>加载更多历史对话</Text>
+                      </TouchableOpacity>
+                    )}
+
+                    {visibleTurns.map((turn) => {
                 const { anchorUserId, userVersions, assistantVersions, defaultIndex } = turn;
                 if (!userVersions.length) return null;
 
@@ -695,12 +954,14 @@ export function ChatbotScreen({ navigation, route }) {
                 const onVersionChange = (direction) =>
                   handleTurnVersionChange(anchorUserId, direction, totalVersions);
 
-                return (
+                      return (
                   <View key={anchorUserId}>
                     {/* 提问气泡：显示当前版本的提问内容 + 版本号（与回答同步） */}
                     <MessageBubble
                       role="user"
                       content={userMsg.content}
+                      imageUri={userMsg.imageUri}
+                      allImageUris={userMsg.allImageUris}
                       userMessageVersions={assistantVersions}
                       currentUserVersionIndex={currentIndex}
                       onUserVersionChange={onVersionChange}
@@ -712,6 +973,12 @@ export function ChatbotScreen({ navigation, route }) {
                       onConfirmEdit={isEditingThis ? handleSendEdit : undefined}
                       isSending={loading}
                       editMetaText={isEditingThis ? editMetaText : undefined}
+                      status={userMsg.status}
+                      onUserRetry={
+                        userMsg.status === 'queued' || userMsg.status === 'failed'
+                          ? () => handleManualRetryUserMessage(userMsg)
+                          : undefined
+                      }
                     />
 
                     {/* 回答气泡：同一轮的当前版本回答，版本箭头会驱动问答同步切换 */}
@@ -731,18 +998,59 @@ export function ChatbotScreen({ navigation, route }) {
                       />
                     )}
                   </View>
+                      );
+                    })}
+
+                    {/* AI 思考中 / 分析中状态提示 */}
+                    {loading && (
+                      <View style={styles.typingContainer}>
+                        <View style={styles.typingBubble}>
+                          <Text style={styles.typingText}>
+                            {lastUserHasImages ? '正在分析图片并生成回复...' : '正在思考回复...'}
+                          </Text>
+                        </View>
+                      </View>
+                    )}
+                  </>
                 );
-              })}
+              })()}
             </View>
           )}
         </ScrollView>
+
+        {/* 图片预览区域 */}
+        {pendingImages.length > 0 && (
+          <View style={styles.pendingImagesContainer}>
+            <ScrollView 
+              horizontal 
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.pendingImagesScrollContent}
+            >
+              {pendingImages.map((img) => (
+                <View key={img.id} style={styles.pendingImageWrapper}>
+                  <Image
+                    source={{ uri: img.uri }}
+                    style={styles.pendingImage}
+                    resizeMode="cover"
+                  />
+                  <TouchableOpacity
+                    style={styles.pendingImageDeleteButton}
+                    onPress={() => handleRemovePendingImage(img.id)}
+                  >
+                    <Ionicons name="close" size={14} color="#FFFFFF" />
+                  </TouchableOpacity>
+                </View>
+              ))}
+            </ScrollView>
+          </View>
+        )}
 
         {/* 底部输入区域 */}
         <View style={styles.inputContainerOuterWithPadding}>
           <View style={[styles.inputContainer, loading && styles.inputContainerDisabled]}>
             <TextInput
               style={[styles.textInput, loading && styles.textInputDisabled]}
-              placeholder="Message..."
+              placeholder="输入消息..."
               placeholderTextColor="#9CA3AF"
               value={message}
               onChangeText={setMessage}
@@ -750,9 +1058,13 @@ export function ChatbotScreen({ navigation, route }) {
               onSubmitEditing={handleSend}
               editable={!loading}
             />
-            <TouchableOpacity style={styles.micButton} disabled={loading}>
+            <TouchableOpacity 
+              style={styles.micButton} 
+              onPress={handlePickImage}
+              disabled={loading}
+            >
               <Ionicons
-                name="mic-outline"
+                name="image-outline"
                 size={22}
                 color={loading ? '#D1D5DB' : '#7C3AED'}
               />
@@ -760,14 +1072,22 @@ export function ChatbotScreen({ navigation, route }) {
           </View>
 
           <TouchableOpacity
-            style={[styles.sendButton, loading && styles.sendButtonDisabled]}
+            style={[
+              styles.sendButton, 
+              loading && styles.sendButtonDisabled,
+              (!message.trim() && pendingImages.length === 0) && styles.sendButtonDisabled
+            ]}
             onPress={handleSend}
-            disabled={loading}
+            disabled={loading || (!message.trim() && pendingImages.length === 0)}
           >
             <Ionicons
               name="paper-plane"
               size={26}
-              color={loading ? '#D1D5DB' : '#ffffff'}
+              color={
+                loading || (!message.trim() && pendingImages.length === 0)
+                  ? '#D1D5DB'
+                  : '#ffffff'
+              }
             />
           </TouchableOpacity>
         </View>
@@ -796,6 +1116,11 @@ const styles = StyleSheet.create({
     height: 32,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  headerRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
   headerTitle: {
     fontSize: 20,
@@ -847,6 +1172,7 @@ const styles = StyleSheet.create({
   welcomeText: {
     flex: 1,
     fontSize: 16,
+    lineHeight: 22, // 与气泡框文本保持一致
     color: '#111827',
   },
   chatList: {
@@ -864,6 +1190,21 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#9CA3AF',
     marginTop: 12,
+  },
+  typingContainer: {
+    marginTop: 8,
+    paddingHorizontal: 8,
+  },
+  typingBubble: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    backgroundColor: '#E5E7EB',
+  },
+  typingText: {
+    fontSize: 13,
+    color: '#4B5563',
   },
   inputContainerOuter: {
     flexDirection: 'row',
@@ -929,6 +1270,42 @@ const styles = StyleSheet.create({
     backgroundColor: '#E5E7EB',
     shadowOpacity: 0,
     elevation: 0,
+  },
+  // 图片预览区域样式
+  pendingImagesContainer: {
+    backgroundColor: '#FFFFFF',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#E5E7EB',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    maxHeight: 120,
+  },
+  pendingImagesScrollContent: {
+    gap: 12,
+    paddingRight: 16,
+  },
+  pendingImageWrapper: {
+    position: 'relative',
+    width: 80,
+    height: 80,
+    borderRadius: 8,
+    overflow: 'hidden', // 只裁剪图片，不裁剪删除按钮
+    backgroundColor: '#F3F4F6',
+  },
+  pendingImage: {
+    width: '100%',
+    height: '100%',
+  },
+  pendingImageDeleteButton: {
+    position: 'absolute',
+    top: 4,
+    right: 4,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
 });
 

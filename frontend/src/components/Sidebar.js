@@ -1,3 +1,18 @@
+/**
+ * 侧边栏组件（抽屉式）
+ * 
+ * 功能：
+ * - 从左侧滑入/滑出的抽屉式侧边栏
+ * - 显示会话列表（复用 SessionListScreen）
+ * - 支持点击遮罩层关闭
+ * - 使用动画实现平滑的打开/关闭效果
+ * - 响应屏幕尺寸变化，自动调整宽度
+ * 
+ * 使用方式：
+ * - 通过 SidebarContext 控制显示/隐藏
+ * - 在 App.js 中作为全局组件渲染
+ */
+
 import React from 'react';
 import {
   Animated,

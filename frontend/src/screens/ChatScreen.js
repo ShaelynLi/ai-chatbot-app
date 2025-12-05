@@ -1,3 +1,17 @@
+/**
+ * 聊天屏幕（旧版，已停用）
+ * 
+ * 注意：
+ * - 此屏幕已被 ChatbotScreen 替代
+ * - 保留此文件仅用于向后兼容或参考
+ * - 新功能请使用 ChatbotScreen（支持图片、多版本、侧边栏等）
+ * 
+ * 功能（历史记录）：
+ * - 基础文本聊天
+ * - 消息多版本管理
+ * - 消息编辑和重发
+ */
+
 import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import {
   Alert,
@@ -156,7 +170,7 @@ export function ChatScreen({ route, navigation }) {
       const errorMsg = await chatDb.addMessage(
         sessionId,
         'assistant',
-        `请求失败：${e.message}`
+        e.message || '发送失败，请检查网络或稍后重试。'
       );
       setMessages((prev) => [...prev, errorMsg]);
     } finally {
@@ -223,7 +237,7 @@ export function ChatScreen({ route, navigation }) {
       const errorMsg = await chatDb.addMessage(
         sessionId,
         'assistant',
-        `请求失败：${e.message}`
+        e.message || '发送失败，请检查网络或稍后重试。'
       );
       setMessages((prev) => [...prev, errorMsg]);
     } finally {
@@ -337,7 +351,7 @@ export function ChatScreen({ route, navigation }) {
                     <Ionicons name="sparkles" size={18} color="#7C3AED" />
                   </View>
                   <Text style={styles.welcomeText}>
-                    Hi, I'm your AI assistant. Ask me anything!
+                    我是你的 AI 助手，有什么可以帮你的吗？
                   </Text>
                 </View>
               </View>

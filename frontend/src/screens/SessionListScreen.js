@@ -1,3 +1,20 @@
+/**
+ * 会话列表屏幕
+ * 
+ * 功能：
+ * - 显示所有会话列表，按时间分组（今天 / 最近 7 天）
+ * - 支持创建新会话
+ * - 支持删除会话（级联删除关联图片）
+ * - 支持重命名会话
+ * - 显示会话预览（最后一条 AI 回复）
+ * - 支持下拉刷新
+ * - 点击会话进入聊天界面
+ * 
+ * 使用场景：
+ * - 作为侧边栏的主要内容
+ * - 独立作为会话管理页面
+ */
+
 import React, { useState, useEffect, useLayoutEffect } from 'react';
 import {
   Alert,
@@ -16,7 +33,7 @@ import { useChat } from '../context/ChatContext';
 import { chatDb } from '../db/database';
 
 export function SessionListScreen({ navigation, onClose }) {
-  const { sessions, refreshSessions } = useChat();
+  const { sessions, refreshSessions, deleteSessionWithImages, createSession } = useChat();
   const [sessionPreviews, setSessionPreviews] = useState({});
   const [expandedSections, setExpandedSections] = useState({
     today: true,
@@ -87,22 +104,23 @@ export function SessionListScreen({ navigation, onClose }) {
     if (!selectedSession) return;
     
     Alert.alert(
-      'Delete Conversation',
-      'Are you sure you want to delete this conversation? This action cannot be undone.',
+      '删除会话',
+      '确定要删除这个会话吗？此操作无法撤销。',
       [
         {
-          text: 'Cancel',
+          text: '取消',
           style: 'cancel',
           onPress: () => setMenuVisible(false),
         },
         {
-          text: 'Delete',
+          text: '删除',
           style: 'destructive',
           onPress: async () => {
             try {
               const deletedSessionId = selectedSession.id;
-              await chatDb.deleteSession(deletedSessionId);
-              await refreshSessions();
+
+              // 通过上下文统一处理会话删除及其图片清理 + 刷新列表
+              const result = await deleteSessionWithImages(deletedSessionId);
               setMenuVisible(false);
               setSelectedSession(null);
               
@@ -111,15 +129,24 @@ export function SessionListScreen({ navigation, onClose }) {
               if (navigation) {
                 const state = navigation.getState();
                 const currentRoute = state?.routes[state?.index];
-                // 检查 Chatbot 或 Chat 路由（兼容旧版本）
-                if ((currentRoute?.name === 'Chatbot' || currentRoute?.name === 'Chat') && 
+                // 检查 Chatbot 路由（当前版本只使用 Chatbot 作为会话入口）
+                if (currentRoute?.name === 'Chatbot' && 
                     currentRoute?.params?.sessionId === deletedSessionId) {
                   navigation.navigate('Chatbot');
                 }
               }
+
+              // 后端未清理成功时提醒用户（前端已删除）
+              if (result && result.backendCleared === false) {
+                Alert.alert(
+                  '已删除本地会话',
+                  '后端上下文暂未清理，请检查网络或后端服务，稍后可在网络恢复后重试删除。',
+                  [{ text: '好的', style: 'default' }],
+                );
+              }
             } catch (error) {
               console.error('Error deleting session:', error);
-              Alert.alert('Error', 'Failed to delete conversation. Please try again.');
+              Alert.alert('错误', '删除会话失败，请稍后重试。');
             }
           },
         },
@@ -137,7 +164,7 @@ export function SessionListScreen({ navigation, onClose }) {
 
   const handleRenameConfirm = async () => {
     if (!selectedSession || !renameText.trim()) {
-      Alert.alert('Error', 'Please enter a valid name.');
+      Alert.alert('错误', '请输入有效的名称。');
       return;
     }
 
@@ -160,7 +187,7 @@ export function SessionListScreen({ navigation, onClose }) {
       setSelectedSession(null);
     } catch (error) {
       console.error('Error renaming session:', error);
-      Alert.alert('Error', 'Failed to rename conversation. Please try again.');
+      Alert.alert('错误', '重命名会话失败，请稍后重试。');
     }
   };
 
@@ -172,23 +199,19 @@ export function SessionListScreen({ navigation, onClose }) {
     const diffHours = Math.floor(diffMs / 3600000);
     const diffDays = Math.floor(diffMs / 86400000);
 
-    if (diffMins < 1) return 'Just now';
-    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffMins < 1) return '刚刚';
+    if (diffMins < 60) return `${diffMins}分钟前`;
     if (diffHours < 24) {
       const hours = date.getHours();
       const mins = date.getMinutes();
-      const ampm = hours >= 12 ? 'PM' : 'AM';
-      const displayHours = hours % 12 || 12;
-      return `${displayHours}:${mins.toString().padStart(2, '0')} ${ampm}`;
+      return `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}`;
     }
     if (diffDays <= 7) {
       const hours = date.getHours();
       const mins = date.getMinutes();
-      const ampm = hours >= 12 ? 'PM' : 'AM';
-      const displayHours = hours % 12 || 12;
-      return `${displayHours}:${mins.toString().padStart(2, '0')} ${ampm}`;
+      return `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}`;
     }
-    return date.toLocaleDateString();
+    return date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' });
   };
 
   const groupSessions = () => {
@@ -305,9 +328,8 @@ export function SessionListScreen({ navigation, onClose }) {
         onClose();
       }
 
-      // 立即在本地数据库中创建一个新的会话
-      const newSession = await chatDb.createSession();
-      await refreshSessions();
+      // 通过上下文创建新会话（内部负责刷新列表）
+      const newSession = await createSession();
 
       // 略微延迟后导航到 Chatbot，并携带新的 sessionId
       // 这样 ChatbotScreen 会加载这个全新的空会话，相当于“新建页面”
@@ -318,7 +340,7 @@ export function SessionListScreen({ navigation, onClose }) {
       }, 100);
     } catch (error) {
       console.error('Error creating new session:', error);
-      Alert.alert('Error', 'Failed to create a new conversation. Please try again.');
+      Alert.alert('错误', '创建新会话失败，请稍后重试。');
     }
   };
 
@@ -343,7 +365,7 @@ export function SessionListScreen({ navigation, onClose }) {
       {/* 顶部导航栏 */}
       <View style={styles.header}>
         <View style={styles.headerLeftPlaceholder} />
-        <Text style={styles.headerTitle}>Conversation</Text>
+        <Text style={styles.headerTitle}>会话记录</Text>
         <TouchableOpacity style={styles.headerIconButton} onPress={handleNewSessionPress}>
           <Ionicons name="add" size={24} color="#111827" />
         </TouchableOpacity>
@@ -355,6 +377,7 @@ export function SessionListScreen({ navigation, onClose }) {
       {/* 会话列表 */}
       <ScrollView 
         style={styles.content} 
+        contentContainerStyle={sessions.length === 0 ? styles.emptyContentContainer : undefined}
         showsVerticalScrollIndicator={false}
         refreshControl={
           <RefreshControl
@@ -365,8 +388,18 @@ export function SessionListScreen({ navigation, onClose }) {
           />
         }
       >
-        {renderSection('Today', today, 'today')}
-        {renderSection('Previous 7 Days', previous7Days, 'previous7Days')}
+        {sessions.length === 0 ? (
+          <View style={styles.emptyState}>
+            <Ionicons name="chatbubbles-outline" size={64} color="#D1D5DB" />
+            <Text style={styles.emptyStateTitle}>暂无会话记录</Text>
+            <Text style={styles.emptyStateSubtitle}>下拉刷新或点击右上角创建新会话</Text>
+          </View>
+        ) : (
+          <>
+            {renderSection('今天', today, 'today')}
+            {renderSection('最近7天', previous7Days, 'previous7Days')}
+          </>
+        )}
       </ScrollView>
 
       {/* 菜单 Modal */}
@@ -395,7 +428,7 @@ export function SessionListScreen({ navigation, onClose }) {
               onPress={handleDelete}
             >
               <Ionicons name="trash-outline" size={20} color="#EF4444" />
-              <Text style={[styles.menuItemText, styles.menuItemTextDanger]}>Delete</Text>
+              <Text style={[styles.menuItemText, styles.menuItemTextDanger]}>删除</Text>
             </TouchableOpacity>
           </View>
         </TouchableOpacity>
@@ -418,7 +451,7 @@ export function SessionListScreen({ navigation, onClose }) {
               <Text style={styles.renameModalTitle}>Rename Conversation</Text>
               <TextInput
                 style={styles.renameInput}
-                placeholder="Enter conversation name"
+                placeholder="输入会话名称"
                 placeholderTextColor="#9CA3AF"
                 value={renameText}
                 onChangeText={setRenameText}
@@ -433,13 +466,13 @@ export function SessionListScreen({ navigation, onClose }) {
                     setRenameText('');
                   }}
                 >
-                  <Text style={styles.renameButtonTextCancel}>Cancel</Text>
+                  <Text style={styles.renameButtonTextCancel}>取消</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={[styles.renameButton, styles.renameButtonConfirm]}
                   onPress={handleRenameConfirm}
                 >
-                  <Text style={styles.renameButtonTextConfirm}>Save</Text>
+                  <Text style={styles.renameButtonTextConfirm}>保存</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -485,6 +518,32 @@ const styles = StyleSheet.create({
   content: {
     flex: 1,
     backgroundColor: '#FFFFFF',
+  },
+  emptyContentContainer: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    minHeight: '100%',
+  },
+  emptyState: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: 80,
+    paddingHorizontal: 40,
+  },
+  emptyStateTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#6B7280',
+    marginTop: 16,
+    marginBottom: 8,
+  },
+  emptyStateSubtitle: {
+    fontSize: 14,
+    color: '#9CA3AF',
+    textAlign: 'center',
+    lineHeight: 20,
   },
   section: {
     marginTop: 24,
