@@ -29,6 +29,7 @@ const THINKING_BUDGET = Number.parseInt(process.env.QWEN_THINKING_BUDGET || '', 
 // 后端持久化会话存储（本地 JSON 文件）
 // 用于维护每个会话的对话历史，实现上下文记忆
 import { getRecentMessages, appendMessages, deleteSession, clearAllSessions } from '../sessionStore.js';
+import crypto from 'crypto';
 
 // 每个会话最多保留多少条 messages（防止上下文无限变长）
 const MAX_HISTORY_MESSAGES = 24; // 例如最多保留最近 12 轮对话
@@ -46,6 +47,7 @@ const MAX_HISTORY_MESSAGES = 24; // 例如最多保留最近 12 轮对话
  */
 export async function postChatCompletion(req, res) {
   const { message, sessionId, imageBase64, imagesBase64 } = req.body || {};
+  const requestId = crypto.randomUUID ? crypto.randomUUID() : `req-${Date.now()}`;
 
   // 验证：至少要有 message 或图片之一
   const hasMessage = message !== undefined && message !== null && message !== '';
@@ -57,7 +59,8 @@ export async function postChatCompletion(req, res) {
   
   if (!hasMessage && !hasImages) {
     return res.status(400).json({ 
-      error: 'Either message or image(s) is required' 
+      error: 'Either message or image(s) is required',
+      requestId,
     });
   }
 
@@ -73,6 +76,7 @@ export async function postChatCompletion(req, res) {
       sessionId: sessionId || 'local-demo-session',
       reply:
         '（模拟回复）当前未配置 DASHSCOPE_API_KEY，请在 backend/.env 中设置后再调用真实 Qwen 接口。',
+      requestId,
     });
   }
 
@@ -139,7 +143,9 @@ export async function postChatCompletion(req, res) {
     
     // 日志：显示使用的模型（方便调试）
     const imageCount = hasImages ? (singleImage ? 1 : (multipleImages ? imagesBase64.length : 0)) : 0;
-    console.log(`[API] 请求类型: ${hasImages ? `多模态（${imageCount}张图片+文本）` : '纯文本'}, 使用模型: ${model}`);
+    console.info(
+      `[API] requestId=${requestId} 请求类型: ${hasImages ? `多模态（${imageCount}张图片+文本）` : '纯文本'}, 使用模型: ${model}`
+    );
 
     // 6. 调用 Qwen API (非流式)
     const requestBody = {
@@ -166,21 +172,27 @@ export async function postChatCompletion(req, res) {
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error('Qwen API error:', response.status, errorText);
+      console.error('Qwen API error:', response.status, `requestId=${requestId}`, errorText);
       return res.status(response.status || 502).json({
         error: 'Qwen API error',
         detail: errorText,
+        requestId,
       });
     }
 
     const data = await response.json();
 
     // 解析 OpenAI 兼容格式的响应
-    const reply =
+    let reply =
       data.choices?.[0]?.message?.content ||
       data.choices?.[0]?.delta?.content ||
       data.output?.text ||
-      JSON.stringify(data);
+      '';
+
+    if (!reply || typeof reply !== 'string') {
+      reply = '很抱歉，暂时没有生成内容，请稍后再试。';
+      console.warn(`[API] requestId=${requestId} 空回复，已使用兜底文案`);
+    }
 
     // 7. 把这轮「问 + 答」写回会话历史，实现持久化记忆
     // 注意：对于多模态消息，content 可能是结构化对象，这里会在 sessionStore 中序列化保存
@@ -192,12 +204,14 @@ export async function postChatCompletion(req, res) {
     return res.json({
       sessionId: sid,
       reply,
+      requestId,
     });
   } catch (err) {
-    console.error('Qwen request failed:', err);
+    console.error('Qwen request failed:', `requestId=${requestId}`, err);
     return res.status(500).json({ 
       error: 'Internal server error',
-      detail: err.message 
+      detail: err.message,
+      requestId,
     });
   }
 }
@@ -209,16 +223,17 @@ export async function postChatCompletion(req, res) {
  */
 export async function postChatTitle(req, res) {
   const { sessionId } = req.body || {};
+  const requestId = crypto.randomUUID ? crypto.randomUUID() : `title-${Date.now()}`;
 
   if (!sessionId) {
-    return res.status(400).json({ error: 'sessionId is required' });
+    return res.status(400).json({ error: 'sessionId is required', requestId });
   }
 
   const apiKey = process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY;
 
   if (!apiKey) {
     // 没有 Key 时，退化为默认标题
-    return res.json({ title: '新会话' });
+    return res.json({ title: '新会话', requestId });
   }
 
   try {
@@ -260,8 +275,8 @@ export async function postChatTitle(req, res) {
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error('Qwen title API error:', response.status, errorText);
-      return res.status(502).json({ error: 'Qwen title API error' });
+      console.error('Qwen title API error:', response.status, `requestId=${requestId}`, errorText);
+      return res.status(502).json({ error: 'Qwen title API error', requestId });
     }
 
     const data = await response.json();
@@ -269,18 +284,22 @@ export async function postChatTitle(req, res) {
       data.choices?.[0]?.message?.content ||
       data.choices?.[0]?.delta?.content ||
       data.output?.text ||
-      '新会话';
+      '';
 
     // 简单清洗：去掉引号和换行
     title = String(title).replace(/["“”]/g, '').split('\n')[0].trim();
-    if (!title) title = '新会话';
+    if (!title) {
+      title = '新会话';
+      console.warn(`[API] requestId=${requestId} 标题为空，已使用默认标题`);
+    }
 
-    return res.json({ title });
+    return res.json({ title, requestId });
   } catch (err) {
-    console.error('Qwen title request failed:', err);
+    console.error('Qwen title request failed:', `requestId=${requestId}`, err);
     return res.status(500).json({
       error: 'Internal server error',
       detail: err.message,
+      requestId,
     });
   }
 }

@@ -38,7 +38,9 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
+import * as FileSystem from 'expo-file-system/legacy';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { Snackbar } from 'react-native-paper';
 import { useSidebar } from '../context/SidebarContext';
 import { chatDb } from '../db/database';
 import { sendMessageToBackend, generateTitleFromBackend, sendMessageWithImage } from '../services/api';
@@ -47,6 +49,7 @@ import { MessageBubble } from '../components/MessageBubble';
 import * as ImagePicker from 'expo-image-picker';
 import { saveImageToLocal, readImageAsBase64, base64ToDataUrl } from '../services/fileStorage';
 import NetInfo from '@react-native-community/netinfo';
+import { toastTexts } from '../utils/strings';
 
 // 最大自动重试次数（用于离线队列功能）
 const MAX_AUTO_RETRY = 3;
@@ -72,6 +75,12 @@ export function ChatbotScreen({ navigation, route }) {
   
   // 待发送的图片预览列表（选择后暂存，等待用户发送）
   const [pendingImages, setPendingImages] = useState([]);
+  const [toastVisible, setToastVisible] = useState(false);
+  const [toastMessage, setToastMessage] = useState('');
+  const showToast = useCallback((msg) => {
+    setToastMessage(msg);
+    setToastVisible(true);
+  }, []);
 
   // 组织消息版本：将同一用户消息的多个AI回复版本组织在一起
   // 将扁平 messages 组织成对话轮（Turn）：每轮包含多版提问 + 多版回答
@@ -268,6 +277,19 @@ export function ChatbotScreen({ navigation, route }) {
     [sessions]
   );
 
+  // 后台补全默认标题：当会话列表变化时，尝试为默认标题的会话补拉标题（静默）
+  useEffect(() => {
+    const fetchTitles = async () => {
+      const targets = sessions.filter((s) => !s.title || s.title === '新会话').slice(0, 3);
+      for (const sess of targets) {
+        await ensureSessionHasTitle(sess.id);
+      }
+    };
+    if (sessions && sessions.length > 0) {
+      fetchTitles().catch(() => {});
+    }
+  }, [sessions, ensureSessionHasTitle]);
+
   // 使用 useFocusEffect 监听页面聚焦和路由参数变化
   // 仅当路由显式带上 sessionId 时，才根据路由切换会话；
   // 普通在主界面连续聊天（没有路由参数变化）时，不会重置当前会话。
@@ -406,6 +428,7 @@ export function ChatbotScreen({ navigation, route }) {
       
       // 刷新会话列表
       await refreshSessions();
+      showToast(toastTexts.newVersion);
     } catch (error) {
       console.error('Error regenerating message:', error);
       Alert.alert('重新生成失败', error.message);
@@ -541,6 +564,9 @@ export function ChatbotScreen({ navigation, route }) {
   };
 
   // 选择图片（添加到预览列表，不立即发送）
+  const MAX_IMAGE_SIZE_MB = 8; // 单张最大 8MB
+  const MAX_TOTAL_IMAGE_MB = 24; // 总计最大 24MB
+
   const handlePickImage = async () => {
     if (loading) return;
 
@@ -564,8 +590,27 @@ export function ChatbotScreen({ navigation, route }) {
 
       // 处理选中的图片（支持多选）
       const newImages = [];
+      let totalBytes = pendingImages.length
+        ? (await Promise.all(
+            pendingImages.map(async (img) => (await FileSystem.getInfoAsync(img.uri)).size || 0)
+          )).reduce((a, b) => a + b, 0)
+        : 0;
+
       for (const asset of result.assets) {
         try {
+          // 大小校验：单张 & 累计
+          const info = await FileSystem.getInfoAsync(asset.uri);
+          const fileSize = info?.size || 0;
+          if (fileSize > MAX_IMAGE_SIZE_MB * 1024 * 1024) {
+            Alert.alert('图片过大', `单张图片限制 ${MAX_IMAGE_SIZE_MB}MB，请重新选择。`);
+            continue;
+          }
+          if (totalBytes + fileSize > MAX_TOTAL_IMAGE_MB * 1024 * 1024) {
+            Alert.alert('图片总大小超限', `最多可选约 ${MAX_TOTAL_IMAGE_MB}MB，已跳过超限图片。`);
+            continue;
+          }
+          totalBytes += fileSize;
+
           // 保存图片到本地文件系统
           const localUri = await saveImageToLocal(asset.uri);
           newImages.push({
@@ -602,6 +647,8 @@ export function ChatbotScreen({ navigation, route }) {
     if (loading || (!hasText && !hasImages) || message.length > 1000) {
       if (!hasText && !hasImages) {
         Alert.alert('提示', '请输入消息或选择图片');
+      } else if (message.length > 1000) {
+        Alert.alert('提示', '单条消息最多 1000 字，请精简后再发送。');
       }
       return;
     }
@@ -962,6 +1009,7 @@ export function ChatbotScreen({ navigation, route }) {
                       content={userMsg.content}
                       imageUri={userMsg.imageUri}
                       allImageUris={userMsg.allImageUris}
+                    createdAt={userMsg.created_at}
                       userMessageVersions={assistantVersions}
                       currentUserVersionIndex={currentIndex}
                       onUserVersionChange={onVersionChange}
@@ -974,9 +1022,13 @@ export function ChatbotScreen({ navigation, route }) {
                       isSending={loading}
                       editMetaText={isEditingThis ? editMetaText : undefined}
                       status={userMsg.status}
+                    onShowToast={showToast}
                       onUserRetry={
                         userMsg.status === 'queued' || userMsg.status === 'failed'
-                          ? () => handleManualRetryUserMessage(userMsg)
+                          ? () => {
+                              showToast(toastTexts.retryQueued);
+                              handleManualRetryUserMessage(userMsg);
+                            }
                           : undefined
                       }
                     />
@@ -995,6 +1047,8 @@ export function ChatbotScreen({ navigation, route }) {
                         }
                         isError={aiMsg.isError}
                         onDelete={() => handleDeleteMessage(aiMsg)}
+                      createdAt={aiMsg.created_at}
+                      onShowToast={showToast}
                       />
                     )}
                   </View>
@@ -1092,6 +1146,15 @@ export function ChatbotScreen({ navigation, route }) {
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
+
+      <Snackbar
+        visible={toastVisible}
+        onDismiss={() => setToastVisible(false)}
+        duration={2200}
+        style={{ marginBottom: 16 }}
+      >
+        {toastMessage}
+      </Snackbar>
     </SafeAreaView>
   );
 }

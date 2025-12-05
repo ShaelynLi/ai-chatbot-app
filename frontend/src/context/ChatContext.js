@@ -29,7 +29,19 @@ export function ChatProvider({ children }) {
 
   // 组件挂载时初始化数据库并加载会话列表
   useEffect(() => {
-    chatDb.init().then(chatDb.listSessions).then(setSessions).catch(console.error);
+    chatDb
+      .init()
+      .then(chatDb.listSessions)
+      .then(async (list) => {
+        setSessions(list);
+        // 启动后做一次孤儿图片清理（静默）
+        try {
+          await chatService.cleanupOrphanImages();
+        } catch (e) {
+          console.warn('[ChatContext] cleanupOrphanImages warning:', e.message);
+        }
+      })
+      .catch(console.error);
   }, []);
 
   /**

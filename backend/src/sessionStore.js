@@ -36,6 +36,7 @@ if (!fs.existsSync(dataDir)) {
 // 内存中的缓存，避免频繁读写磁盘
 // 首次读取后缓存到内存，后续操作直接修改缓存，最后统一写回文件
 let cache = null;
+let writeQueue = Promise.resolve(); // 简单写入队列，串行化文件写操作
 
 /**
  * 从文件加载存储数据到内存缓存
@@ -73,9 +74,13 @@ function loadStore() {
  * @param {Object} store - 要保存的存储对象
  */
 function saveStore(store) {
-  cache = store;
-  // 使用 JSON.stringify 格式化输出（缩进 2 空格），便于调试和查看
-  fs.writeFileSync(storePath, JSON.stringify(store, null, 2), 'utf-8');
+  // 所有写操作串行化，避免并发写导致文件损坏
+  writeQueue = writeQueue.then(async () => {
+    cache = store;
+    const content = JSON.stringify(store, null, 2);
+    await fs.promises.writeFile(storePath, content, 'utf-8');
+  });
+  return writeQueue;
 }
 
 /**
@@ -118,7 +123,7 @@ export async function appendMessages(sessionId, messages) {
       : merged;
 
   store.sessions[sessionId] = trimmed;
-  saveStore(store);
+  await saveStore(store);
 }
 
 /**
@@ -131,7 +136,7 @@ export async function deleteSession(sessionId) {
   const store = loadStore();
   if (store.sessions[sessionId]) {
     delete store.sessions[sessionId];
-    saveStore(store);
+    await saveStore(store);
   }
 }
 
@@ -142,6 +147,6 @@ export async function deleteSession(sessionId) {
 export async function clearAllSessions() {
   const store = loadStore();
   store.sessions = {};
-  saveStore(store);
+  await saveStore(store);
 }
 

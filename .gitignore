@@ -25,6 +25,7 @@ pnpm-debug.log*
 dist/
 build/
 coverage/
+backend/data/
 
 ### IDE / Editor
 .vscode/

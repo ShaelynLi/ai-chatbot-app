@@ -64,6 +64,31 @@ export async function deleteLocalFile(uri) {
 }
 
 /**
+ * 列出本地 images 目录下的所有图片文件
+ * @returns {Promise<Array<{ uri: string, size: number }>>}
+ */
+export async function getAllLocalImages() {
+  try {
+    const dirInfo = await FileSystem.getInfoAsync(IMAGES_DIR);
+    if (!dirInfo.exists) return [];
+
+    const files = await FileSystem.readDirectoryAsync(IMAGES_DIR);
+    const result = [];
+    for (const name of files) {
+      const uri = IMAGES_DIR + name;
+      const info = await FileSystem.getInfoAsync(uri);
+      if (info.exists) {
+        result.push({ uri, size: info.size || 0 });
+      }
+    }
+    return result;
+  } catch (error) {
+    console.warn('getAllLocalImages error:', error);
+    return [];
+  }
+}
+
+/**
  * 读取图片文件并转换为 base64
  * @param {string} uri - 本地文件 URI
  * @returns {Promise<string>} base64 字符串（不包含 data:image 前缀）

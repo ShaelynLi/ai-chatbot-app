@@ -1,5 +1,5 @@
 import { chatDb } from '../db/database';
-import { deleteLocalFile } from './fileStorage';
+import { deleteLocalFile, getAllLocalImages } from './fileStorage';
 import { clearAllBackendSessions, deleteBackendSession } from './api';
 
 /**
@@ -42,6 +42,33 @@ export const chatService = {
     }
 
     return { success: true, backendCleared };
+  },
+
+  /**
+   * 清理孤立的图片文件或数据库记录：
+   * - 删除磁盘上未被数据库引用的文件
+   * - 删除数据库中指向不存在文件的记录
+   */
+  async cleanupOrphanImages() {
+    const imagesInDb = await chatDb.listAllImages();
+    const localFiles = await getAllLocalImages(); // 仅文件名
+
+    const dbUris = new Set(imagesInDb.map((img) => img.uri));
+    const localSet = new Set(localFiles.map((f) => f.uri));
+
+    // 1) 删除磁盘孤儿文件（有文件但无 DB 记录）
+    for (const file of localFiles) {
+      if (!dbUris.has(file.uri)) {
+        await deleteLocalFile(file.uri);
+      }
+    }
+
+    // 2) 删除 DB 孤儿记录（有记录但文件不存在）
+    for (const img of imagesInDb) {
+      if (!localSet.has(img.uri)) {
+        await chatDb.deleteImage(img.id);
+      }
+    }
   },
 
   /**

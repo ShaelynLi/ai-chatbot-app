@@ -29,6 +29,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import { Snackbar } from 'react-native-paper';
 import { useChat } from '../context/ChatContext';
 import { chatDb } from '../db/database';
 
@@ -43,8 +44,21 @@ export function SessionListScreen({ navigation, onClose }) {
   const [selectedSession, setSelectedSession] = useState(null);
   const [renameModalVisible, setRenameModalVisible] = useState(false);
   const [renameText, setRenameText] = useState('');
+  const [snackbarVisible, setSnackbarVisible] = useState(false);
+  const [snackbarMessage, setSnackbarMessage] = useState('');
+  const isSkeletonLoading = refreshing && sessions.length === 0;
   const [isLayoutReady, setIsLayoutReady] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+
+  const renderSkeletonCards = () => {
+    const placeholders = [1, 2, 3, 4];
+    return placeholders.map((idx) => (
+      <View key={idx} style={styles.skeletonCard}>
+        <View style={styles.skeletonTitle} />
+        <View style={styles.skeletonPreview} />
+      </View>
+    ));
+  };
 
   // 加载每个会话的预览消息
   const loadPreviews = async () => {
@@ -136,14 +150,13 @@ export function SessionListScreen({ navigation, onClose }) {
                 }
               }
 
-              // 后端未清理成功时提醒用户（前端已删除）
+              // 轻提示：前端已删；后端未清理成功时提示用户
               if (result && result.backendCleared === false) {
-                Alert.alert(
-                  '已删除本地会话',
-                  '后端上下文暂未清理，请检查网络或后端服务，稍后可在网络恢复后重试删除。',
-                  [{ text: '好的', style: 'default' }],
-                );
+                setSnackbarMessage('已删除本地会话，后端未清理成功，请稍后重试。');
+              } else {
+                setSnackbarMessage('已删除本地会话。');
               }
+              setSnackbarVisible(true);
             } catch (error) {
               console.error('Error deleting session:', error);
               Alert.alert('错误', '删除会话失败，请稍后重试。');
@@ -388,7 +401,9 @@ export function SessionListScreen({ navigation, onClose }) {
           />
         }
       >
-        {sessions.length === 0 ? (
+        {isSkeletonLoading ? (
+          <View style={styles.skeletonContainer}>{renderSkeletonCards()}</View>
+        ) : sessions.length === 0 ? (
           <View style={styles.emptyState}>
             <Ionicons name="chatbubbles-outline" size={64} color="#D1D5DB" />
             <Text style={styles.emptyStateTitle}>暂无会话记录</Text>
@@ -433,6 +448,16 @@ export function SessionListScreen({ navigation, onClose }) {
           </View>
         </TouchableOpacity>
       </Modal>
+
+      {/* 删除状态提示 */}
+      <Snackbar
+        visible={snackbarVisible}
+        onDismiss={() => setSnackbarVisible(false)}
+        duration={2500}
+        style={styles.snackbar}
+      >
+        {snackbarMessage}
+      </Snackbar>
 
       {/* 重命名 Modal */}
       <Modal
@@ -484,6 +509,32 @@ export function SessionListScreen({ navigation, onClose }) {
 }
 
 const styles = StyleSheet.create({
+  snackbar: {
+    marginBottom: 24,
+  },
+  skeletonContainer: {
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    gap: 12,
+  },
+  skeletonCard: {
+    backgroundColor: '#F3F4F6',
+    borderRadius: 12,
+    padding: 12,
+  },
+  skeletonTitle: {
+    height: 18,
+    width: '60%',
+    backgroundColor: '#E5E7EB',
+    borderRadius: 8,
+    marginBottom: 8,
+  },
+  skeletonPreview: {
+    height: 14,
+    width: '90%',
+    backgroundColor: '#E5E7EB',
+    borderRadius: 8,
+  },
   safeArea: {
     flex: 1,
     backgroundColor: '#FFFFFF',

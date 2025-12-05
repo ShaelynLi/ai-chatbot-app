@@ -24,6 +24,7 @@ import React, { useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, TextInput, Alert, Image, Modal, ScrollView } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
+import { toastTexts, alertTexts } from '../utils/strings';
 
 export function MessageBubble({
   role,
@@ -54,6 +55,8 @@ export function MessageBubble({
   // 发送状态（仅用户消息使用）：sending | queued | failed | sent
   status,
   onUserRetry,
+  createdAt,
+  onShowToast,
 }) {
   const isUser = role === 'user';
   const isQueued = isUser && status === 'queued';
@@ -75,14 +78,24 @@ export function MessageBubble({
     currentUserVersionIndex !== undefined ? currentUserVersionIndex + 1 : 1;
   const totalUserVersions = userMessageVersions ? userMessageVersions.length : 1;
 
+  const formatTime = (ts) => {
+    if (!ts) return '';
+    const d = new Date(ts);
+    const hh = `${d.getHours()}`.padStart(2, '0');
+    const mm = `${d.getMinutes()}`.padStart(2, '0');
+    return `${hh}:${mm}`;
+  };
+
   const handleCopy = async () => {
     try {
       await Clipboard.setStringAsync(content);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
+      onShowToast && onShowToast(toastTexts.copySuccess);
     } catch (e) {
       console.error(e);
-      Alert.alert('复制失败', '无法复制到剪贴板，请稍后重试');
+      Alert.alert(alertTexts.copyFailTitle, alertTexts.copyFailMessage);
+      onShowToast && onShowToast(toastTexts.copyFail);
     }
   };
 
@@ -150,6 +163,21 @@ export function MessageBubble({
               ))}
             </ScrollView>
           )}
+        </View>
+      )}
+
+      {/* 图片-only 的时间/状态条：保持与文本气泡信息一致 */}
+      {isUser && imagesToShow.length > 0 && (!content || !content.trim()) && (
+        <View style={styles.imageMetaRow}>
+          <Text style={styles.imageMetaTime}>{formatTime(createdAt)}</Text>
+          {isSendingStatus && <Text style={styles.imageMetaStatus}>发送中</Text>}
+          {isQueued && <Text style={styles.imageMetaStatus}>待发送</Text>}
+          {isFailed && <Text style={styles.imageMetaStatusFailed}>发送失败</Text>}
+        </View>
+      )}
+      {!isUser && imagesToShow.length > 0 && (!content || !content.trim()) && (
+        <View style={styles.imageMetaRow}>
+          <Text style={styles.imageMetaTime}>{formatTime(createdAt)}</Text>
         </View>
       )}
 
@@ -735,6 +763,32 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 14,
     fontWeight: '500',
+  },
+  imageMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 4,
+    gap: 8,
+  },
+  imageMetaTime: {
+    fontSize: 12,
+    color: '#9CA3AF',
+  },
+  imageMetaStatus: {
+    fontSize: 12,
+    color: '#6B7280',
+    backgroundColor: 'rgba(124, 58, 237, 0.12)',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 12,
+  },
+  imageMetaStatusFailed: {
+    fontSize: 12,
+    color: '#B91C1C',
+    backgroundColor: 'rgba(239, 68, 68, 0.12)',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 12,
   },
 });
 

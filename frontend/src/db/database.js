@@ -98,6 +98,11 @@ export const chatDb = {
           retry_count INTEGER
         );
       `);
+      // 常用查询字段索引
+      await database.execAsync(`
+        CREATE INDEX IF NOT EXISTS idx_messages_session_created
+        ON messages (session_id, created_at DESC);
+      `);
       // 添加 parent_message_id 列的迁移（如果列不存在）
       try {
         await database.execAsync(`
@@ -138,6 +143,10 @@ export const chatDb = {
           created_at INTEGER NOT NULL,
           FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );
+      `);
+      await database.execAsync(`
+        CREATE INDEX IF NOT EXISTS idx_images_session_created
+        ON images (session_id, created_at DESC);
       `);
     } catch (error) {
       console.error('Database init error:', error);
@@ -531,6 +540,37 @@ export const chatDb = {
       }
     } catch (error) {
       console.error('List images error:', error);
+      throw error;
+    }
+  },
+
+  /**
+   * 列出所有图片记录，按创建时间倒序
+   * @returns {Promise<Array<{id: number, session_id: number, uri: string, created_at: number}>>}
+   */
+  async listAllImages() {
+    const database = await getDb();
+    try {
+      const statement = await database.prepareAsync(
+        'SELECT id, session_id, uri, created_at FROM images ORDER BY created_at DESC;'
+      );
+      try {
+        const rows = [];
+        const result = await statement.executeAsync();
+        for await (const row of result) {
+          rows.push({
+            id: row.id,
+            session_id: row.session_id,
+            uri: row.uri,
+            created_at: row.created_at,
+          });
+        }
+        return rows;
+      } finally {
+        await statement.finalizeAsync();
+      }
+    } catch (error) {
+      console.error('List all images error:', error);
       throw error;
     }
   },
